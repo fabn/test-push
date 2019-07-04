@@ -1,0 +1,107 @@
+# Default docker image when not specified in single task
+image: ruby:2.6.2
+
+variables:
+  REDIS_URL: "redis://redis:6379"
+  BUNDLER_VERSION: "2.0.1"
+  IMAGE_NAME: "$CI_REGISTRY_IMAGE:$CI_COMMIT_REF_SLUG"
+  TEST_IMAGE_NAME: "${CI_REGISTRY_IMAGE}-test:$CI_COMMIT_SHORT_SHA"
+
+# Template task to build docker images
+.docker-image: &docker-image
+  image: docker:stable
+  stage: build
+  services:
+    - docker:dind
+  # Try to speedup builds with overlay driver, see https://gitlab.com/gitlab-org/gitlab-ce/issues/17861#note_12991518
+  variables:
+    DOCKER_DRIVER: overlay2
+    IMAGE_NAME: "$CI_REGISTRY_IMAGE:$CI_COMMIT_REF_SLUG"
+  script:
+    - docker login -u "gitlab-ci-token" -p "$CI_BUILD_TOKEN" $CI_REGISTRY
+    - docker pull $CI_REGISTRY_IMAGE || true # don't fail on missing images
+    # Build image using cached layers
+    - docker build -f $DOCKERFILE --cache-from $CI_REGISTRY_IMAGE:latest --tag $IMAGE_NAME --tag $CI_REGISTRY_IMAGE:latest .
+    - docker push $IMAGE_NAME
+    # Also push the image with latest tag
+    - docker push "$CI_REGISTRY_IMAGE"
+
+# Build the image for backend application
+build-backend-image:
+  <<: *docker-image
+  variables:
+    DOCKERFILE: Dockerfile
+
+# Build the image for running tests
+build-test-image:
+  <<: *docker-image
+  variables:
+    DOCKERFILE: Dockerfile # In Uala will be Dockerfile_test
+    IMAGE_NAME: "${CI_REGISTRY_IMAGE}-test:${CI_COMMIT_SHA}"
+
+rubocop:
+  stage: test
+  image: "${CI_REGISTRY_IMAGE}-test:${CI_COMMIT_SHA}"
+  script: 'bundle exec rubocop --parallel'
+  except:
+    - schedules
+
+rspec:
+  stage: test
+  image: "${CI_REGISTRY_IMAGE}-test:${CI_COMMIT_SHA}"
+  services:
+    - postgres
+    - redis
+  variables:
+    RAILS_ENV: test
+    RACK_ENV: test
+    REDIS_URL: "redis://redis:6379"
+    ENV_TEST_NUMBER: '3'
+    TZ: 'Europe/Rome'
+    REDISCLOUD_URL: 'redis://redis:6379'
+    APP_HOST: 'test.hairdres.sr'
+    FRONTEND_APP_HOST: 'test.hairdres.sr'
+    BACKEND_APP_HOST: 'test.hairdres.sr'
+  before_script:
+    - env
+    - bundle --version
+    - cp -f config/database.ci.yml config/database.yml
+    - bundle exec rake parallel:create parallel:load_schema parallel:prepare --trace
+  script: 'bundle exec rake parallel:spec[3]'
+
+.rancher-deploy: &rancher-deploy
+  image: bjm904/rancher-cli-k8s:v2.0.4
+  stage: deploy
+  variables:
+    RANCHER_ACCESS_KEY: "TBD"
+    RANCHER_SECRET_KEY: "TBD"
+    RANCHER_SERVER_URL: "https://infra.uala.it"
+    RANCHER_PROJECT: "Env-Production"
+    RANCHER_NAMESPACE: "backend-env-production"
+    RANCHER_CREDENTIALS_ID: "Rancher-Env-Production"
+  script:
+    - rancher kubectl set image deployment admin admin=$IMAGE_NAME -n $RANCHER_NAMESPACE
+  when: manual
+
+develop-deploy:
+  <<: *rancher-deploy
+  variables:
+    RANCHER_PROJECT: "Env-Develop"
+    RANCHER_NAMESPACE: "backend-env-develop"
+    RANCHER_CREDENTIALS_ID: "Rancher-Env-Develop"
+  environment:
+    name: develop
+    url: https://admin.uala.it # Check this later
+
+# Deploy only tags in production
+production-deploy:
+  <<: *rancher-deploy
+  variables:
+    RANCHER_PROJECT: "Env-Production"
+    RANCHER_NAMESPACE: "backend-env-production"
+    RANCHER_CREDENTIALS_ID: "Rancher-Env-Production"
+  environment:
+    name: production
+    url: https://admin.uala.it
+  only:
+    - tags
